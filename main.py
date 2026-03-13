@@ -32,8 +32,7 @@ def get_audio():
             'quiet': False,
             'format': 'bestaudio[ext=webm]/bestaudio/best',
             'noplaylist': True,
-            'extractor_args': {'youtube': {'player_client': ['android']}},
-        }
+            }
         if COOKIES_FILE and os.path.exists(COOKIES_FILE):
             ydl_opts['cookiefile'] = COOKIES_FILE
             print(f"Using cookies from {COOKIES_FILE}")
