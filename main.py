@@ -30,7 +30,7 @@ def get_audio():
             'quiet': False,
             'format': 'worstaudio/worst',
             'noplaylist': True,
-            'extractor_args': {'youtube': {'player_client': ['android_vr']}},
+            'extractor_args': {'youtube': {'player_client': ['web']}},
         }
         if COOKIES_FILE and os.path.exists(COOKIES_FILE):
             ydl_opts['cookiefile'] = COOKIES_FILE
