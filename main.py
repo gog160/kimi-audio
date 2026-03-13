@@ -30,7 +30,7 @@ def get_audio():
     try:
         ydl_opts = {
             'quiet': False,
-            'format': 'bestaudio[ext=webm]/bestaudio/best',
+            'format': 'bestaudio/best',
             'noplaylist': True,
             }
         if COOKIES_FILE and os.path.exists(COOKIES_FILE):
