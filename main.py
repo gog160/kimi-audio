@@ -11,6 +11,9 @@ def init_cookies():
     cookies = os.environ.get('YOUTUBE_COOKIES', '').strip()
     if not cookies:
         return None
+    # Añadir encabezado Netscape si no está
+    if not cookies.startswith('# Netscape'):
+        cookies = '# Netscape HTTP Cookie File\n# http://curl.haxx.se/rfc/cookie_spec.html\n# This is a generated file!  Do not edit.\n\n' + cookies
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
     tmp.write(cookies)
     tmp.close()
