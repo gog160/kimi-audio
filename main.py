@@ -4,7 +4,6 @@ import os
 import tempfile
 import base64
 import time
-import threading
 
 app = Flask(__name__)
 COOKIES_FILE = None
@@ -32,25 +31,36 @@ def init_cookies():
 init_cookies()
 
 def get_stream(query):
-    ydl_opts = {
-    'quiet': True,
-    'skip_download': True,
-    'noplaylist': True,
-    'format': '140/251/250/249/139/171/bestaudio/best',
-    'default_search': 'ytsearch1',
-    'geo_bypass': True,
-    'geo_bypass_country': 'US',
-    'force_ipv4': True,
-    'extract_flat': False,
-}
-    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-        ydl_opts['cookiefile'] = COOKIES_FILE
+    search_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'extract_flat': True,
+        'default_search': 'ytsearch1',
+        'noplaylist': True,
+        'force_ipv4': True,
+    }
+    with yt_dlp.YoutubeDL(search_opts) as ydl:
+        r = ydl.extract_info(query, download=False)
+        video = r['entries'][0]
+        video_id = video['id']
+        title = video.get('title', query)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=False)
-        if 'entries' in info:
-            info = info['entries'][0]
-        return info['url'], info.get('title', query)
+    stream_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'noplaylist': True,
+        'format': 'bestaudio/best',
+        'force_ipv4': True,
+    }
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        stream_opts['cookiefile'] = COOKIES_FILE
+
+    with yt_dlp.YoutubeDL(stream_opts) as ydl:
+        info = ydl.extract_info(
+            f'https://www.youtube.com/watch?v={video_id}',
+            download=False
+        )
+    return info['url'], info.get('title', title)
 
 @app.route('/audio')
 def get_audio():
@@ -58,7 +68,6 @@ def get_audio():
     if not q:
         return jsonify({'error': 'no query'}), 400
 
-    # Cache con TTL
     if q in CACHE:
         url, title, ts = CACHE[q]
         if time.time() - ts < CACHE_TTL:
