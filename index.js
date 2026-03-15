@@ -10,9 +10,15 @@ const TTL = 6 * 60 * 60 * 1000;          // 6 horas
 const CLEANUP_INTERVAL = 10 * 60 * 1000; // 10 minutos
 const REQUEST_TIMEOUT = 15000;            // 15 segundos
 const MAX_CONCURRENCY = 2;                 // Procesos simultáneos
+const MAX_RETRIES_PER_CLIENT = 2;          // Reintentos por cliente
 
-// Clientes de YouTube que NO requieren PO Token (actualmente)
-const YT_CLIENTS = ['tv_embedded', 'web'];
+// Clientes de YouTube que NO requieren PO Token (ampliados)
+const YT_CLIENTS = [
+  'tv_embedded',
+  'tv',
+  'web',
+  'web_safari'
+];
 
 // Lista de user‑agents realistas (rotación)
 const USER_AGENTS = [
@@ -25,7 +31,6 @@ const USER_AGENTS = [
 // ================= CACHÉ EN MEMORIA =================
 const cache = new Map();
 
-// Limpieza periódica de entradas expiradas
 setInterval(() => {
   const now = Date.now();
   for (const [key, { timestamp }] of cache) {
@@ -37,23 +42,19 @@ setInterval(() => {
 const limit = pLimit(MAX_CONCURRENCY);
 
 // ================= FUNCIONES AUXILIARES =================
-// Normaliza la consulta (por ahora solo trim, pero podrías añadir más)
 function normalizeQuery(q) {
   return q.trim();
 }
 
-// Sanitiza la consulta para evitar inyección de comandos en shell
 function safeQuery(q) {
-  // Elimina caracteres peligrosos: ` $ \ ; " '
+  // Elimina caracteres peligrosos para shell: ` $ \ ; " '
   return q.replace(/[`$\\;"']/g, '');
 }
 
-// Devuelve un user‑agent aleatorio de la lista
 function randomUA() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
-// Ejecuta un comando y devuelve stdout como promesa
 function execPromise(cmd, timeout = REQUEST_TIMEOUT) {
   return new Promise((resolve, reject) => {
     exec(cmd, { timeout }, (err, stdout, stderr) => {
@@ -63,28 +64,42 @@ function execPromise(cmd, timeout = REQUEST_TIMEOUT) {
   });
 }
 
-// ================= RESOLVER YOUTUBE =================
+// ================= RESOLVER YOUTUBE (CON REINTENTOS) =================
 async function resolveYoutube(query) {
   const ua = randomUA();
   const safeQ = safeQuery(query);
 
   for (const client of YT_CLIENTS) {
-    try {
-      // Priorizamos formato m4a para mejor compatibilidad con Alexa,
-      // pero si no existe, bestaudio elige el mejor disponible.
-      const cmd = `./yt-dlp --no-playlist -f "bestaudio[ext=m4a]/bestaudio" \
-        --extractor-args "youtube:player_client=${client}" \
-        --user-agent "${ua}" \
-        -g "ytsearch1:${safeQ}"`;
+    for (let attempt = 1; attempt <= MAX_RETRIES_PER_CLIENT; attempt++) {
+      try {
+        // Construimos el comando con:
+        // - formato preferido m4a, sino bestaudio
+        // - extractor args para el cliente actual
+        // - user-agent rotado
+        // - geo-bypass
+        // - filtro para excluir livestreams
+        // - búsqueda en ytsearch1
+        const cmd = `./yt-dlp --no-playlist \
+          -f "bestaudio[ext=m4a]/bestaudio" \
+          --extractor-args "youtube:player_client=${client}" \
+          --user-agent "${ua}" \
+          --geo-bypass \
+          --match-filter "!is_live" \
+          -g "ytsearch1:${safeQ}"`;
 
-      const stdout = await execPromise(cmd);
-      const url = stdout.trim();
-      if (url) return url;
-    } catch (e) {
-      console.log(`Cliente YouTube "${client}" falló: ${e.message}`);
+        const stdout = await execPromise(cmd);
+        const url = stdout.trim();
+        if (url) return url;
+      } catch (e) {
+        console.log(`Cliente "${client}" (intento ${attempt}) falló: ${e.message}`);
+        // Si no es el último intento, esperamos un poco antes de reintentar
+        if (attempt < MAX_RETRIES_PER_CLIENT) {
+          await new Promise(r => setTimeout(r, 500)); // espera 0.5s
+        }
+      }
     }
   }
-  throw new Error('YouTube no devolvió URL');
+  throw new Error('YouTube no devolvió URL tras todos los intentos');
 }
 
 // ================= FALLBACK SOUNDCLOUD =================
@@ -101,7 +116,7 @@ async function resolveSoundcloud(query) {
   throw new Error('SoundCloud no devolvió URL');
 }
 
-// ================= OBTENER AUDIO (con fallback) =================
+// ================= OBTENER AUDIO (CON FALLBACK) =================
 async function getAudio(query) {
   try {
     return await resolveYoutube(query);
