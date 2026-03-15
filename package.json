@@ -1,0 +1,16 @@
+{
+  "name": "kimi-audio",
+  "version": "1.0.0",
+  "description": "Backend audio para KIMI Bot / Alexa",
+  "main": "index.js",
+  "scripts": {
+    "build": "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o yt-dlp && chmod +x yt-dlp",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
