@@ -1,5 +1,9 @@
 const express = require('express');
 const { exec } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
 const app = express();
 const port = process.env.PORT || 10000;
 
@@ -20,11 +24,19 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15',
 ];
 
-// Opcional: cookies desde variable de entorno (descomentar si se usan)
-// const COOKIES_FILE = process.env.YTDLP_COOKIES ? '/tmp/cookies.txt' : null;
-// if (COOKIES_FILE && process.env.YTDLP_COOKIES) {
-//   require('fs').writeFileSync(COOKIES_FILE, process.env.YTDLP_COOKIES);
-// }
+// ================= COOKIES (desde variable de entorno) =================
+let COOKIES_FILE = null;
+if (process.env.YOUTUBE_COOKIES_BASE64) {
+  try {
+    const cookieContent = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf-8');
+    const tmpPath = path.join(os.tmpdir(), 'cookies.txt');
+    fs.writeFileSync(tmpPath, cookieContent);
+    COOKIES_FILE = tmpPath;
+    console.log('✅ Cookies cargadas desde YOUTUBE_COOKIES_BASE64');
+  } catch (e) {
+    console.error('⚠️ Error al procesar cookies:', e.message);
+  }
+}
 
 // ================= CACHÉ EN MEMORIA =================
 const cache = new Map();
@@ -74,11 +86,9 @@ async function getAudioUrl(query) {
     try {
       let cmd = `./yt-dlp -f "bestaudio[ext=m4a]/bestaudio" \
         --extractor-args "youtube:player_client=${client}" \
-        --user-agent "${ua}" \
-        -g "ytsearch1:${safeQ}"`;
-
-      // Añadir cookies si están configuradas (descomentar si aplica)
-      // if (COOKIES_FILE) cmd += ` --cookies "${COOKIES_FILE}"`;
+        --user-agent "${ua}"`;
+      if (COOKIES_FILE) cmd += ` --cookies "${COOKIES_FILE}"`;
+      cmd += ` -g "ytsearch1:${safeQ}"`;
 
       const url = await execPromise(cmd);
       if (url) return url;
@@ -90,7 +100,7 @@ async function getAudioUrl(query) {
   // Fallback: SoundCloud
   try {
     let cmd = `./yt-dlp -f "bestaudio" -g "scsearch1:${safeQ}"`;
-    // if (COOKIES_FILE) cmd += ` --cookies "${COOKIES_FILE}"`;
+    if (COOKIES_FILE) cmd += ` --cookies "${COOKIES_FILE}"`; // opcional, pero por si acaso
     const url = await execPromise(cmd);
     if (url) return url;
   } catch (err) {
