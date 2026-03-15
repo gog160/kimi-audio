@@ -33,15 +33,16 @@ init_cookies()
 
 def get_stream(query):
     ydl_opts = {
-        'quiet': True,
-        'skip_download': True,
-        'noplaylist': True,
-        'format': '140/251/250/249/bestaudio/best',
-        'default_search': 'ytsearch1',
-        'geo_bypass': True,
-        'geo_bypass_country': 'US',
-        'force_ipv4': True,
-    }
+    'quiet': True,
+    'skip_download': True,
+    'noplaylist': True,
+    'format': '140/251/250/249/139/171/bestaudio/best',
+    'default_search': 'ytsearch1',
+    'geo_bypass': True,
+    'geo_bypass_country': 'US',
+    'force_ipv4': True,
+    'extract_flat': False,
+}
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         ydl_opts['cookiefile'] = COOKIES_FILE
 
