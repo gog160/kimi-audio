@@ -14,16 +14,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 
 # ── Configuración ──────────────────────────────────────────────
-CACHE_TTL       = 15 * 86400   # 15 días metadatos
-URL_CACHE_TTL   = 600          # 10 min URLs streaming
+CACHE_TTL       = 15 * 86400
+URL_CACHE_TTL   = 600
 PENALTY_TIMEOUT = 60
 PENALTY_ERROR   = 300
 REQUEST_TIMEOUT = 4
 
 PIPED_INSTANCES = [
+    "https://pipedapi.lunar.icu",
+    "https://pipedapi.pfcd.me",
+    "https://pipedapi.esmailelbob.xyz",
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.syncpundit.io",
-    "https://pipedapi.adminforge.de",
 ]
 
 COMMANDS = sorted([
@@ -83,7 +85,7 @@ def piped_search(query):
         if inst in FAILED and time.time() < FAILED[inst]:
             continue
         try:
-            r = requests.get(f"{inst}/search", params={"q": query, "filter": "music_songs"},
+            r = requests.get(f"{inst}/search", params={"q": query},
                              timeout=REQUEST_TIMEOUT)
             r.raise_for_status()
             items = r.json().get("items", [])
@@ -135,13 +137,18 @@ def ytdlp_resolve(query):
 
 def ytdlp_stream(video_id):
     opts = {
-        "quiet": True, "skip_download": True,
-        "noplaylist": True, "format": "bestaudio/best", "force_ipv4": True,
+        "quiet": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "format": "bestaudio/best",
+        "force_ipv4": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        info = ydl.extract_info(
+            f"https://www.youtube.com/watch?v={video_id}", download=False)
         return info["url"]
 
 # ── URL con cache secundaria ───────────────────────────────────
@@ -191,14 +198,12 @@ def audio():
                 db.execute("DELETE FROM cache WHERE key=?", (key,))
                 db.commit()
 
-    # Piped primero
     result = piped_search(q)
     if result:
         video_id, title = result
         source = "piped"
         logging.info(f"Piped: {title} ({video_id})")
     else:
-        # Fallback yt-dlp
         try:
             video_id, title = ytdlp_resolve(q)
             source = "ytdlp"
