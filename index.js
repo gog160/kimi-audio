@@ -1,45 +1,31 @@
 const express = require('express');
 const { exec } = require('child_process');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
+const pLimit = require('p-limit');
 
 const app = express();
-const port = process.env.PORT || 10000;
+const port = process.env.PORT || 3000;
 
 // ================= CONFIGURACIÓN =================
 const TTL = 6 * 60 * 60 * 1000;          // 6 horas
 const CLEANUP_INTERVAL = 10 * 60 * 1000; // 10 minutos
-const REQUEST_TIMEOUT = 20000;            // 20 segundos
-const MAX_CONCURRENT = 2;                  // Máximo de procesos yt-dlp simultáneos
+const REQUEST_TIMEOUT = 15000;            // 15 segundos
+const MAX_CONCURRENCY = 2;                 // Procesos simultáneos
 
-// Clientes de YouTube en orden de preferencia (android suele ser el más permisivo)
-const YT_CLIENTS = ['android', 'ios', 'tv_embedded', 'web'];
+// Clientes de YouTube que NO requieren PO Token (actualmente)
+const YT_CLIENTS = ['tv_embedded', 'web'];
 
 // Lista de user‑agents realistas (rotación)
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1',
-  'Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 Chrome/112.0.0.0 Mobile Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36'
 ];
-
-// ================= COOKIES (desde variable de entorno) =================
-let COOKIES_FILE = null;
-if (process.env.YOUTUBE_COOKIES_BASE64) {
-  try {
-    const cookieContent = Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64').toString('utf-8');
-    const tmpPath = path.join(os.tmpdir(), 'cookies.txt');
-    fs.writeFileSync(tmpPath, cookieContent);
-    COOKIES_FILE = tmpPath;
-    console.log('✅ Cookies cargadas desde YOUTUBE_COOKIES_BASE64');
-  } catch (e) {
-    console.error('⚠️ Error al procesar cookies:', e.message);
-  }
-}
 
 // ================= CACHÉ EN MEMORIA =================
 const cache = new Map();
+
+// Limpieza periódica de entradas expiradas
 setInterval(() => {
   const now = Date.now();
   for (const [key, { timestamp }] of cache) {
@@ -47,67 +33,82 @@ setInterval(() => {
   }
 }, CLEANUP_INTERVAL);
 
-// ================= CONTROL DE CONCURRENCIA =================
-let activeRequests = 0;
+// ================= LIMITADOR DE CONCURRENCIA =================
+const limit = pLimit(MAX_CONCURRENCY);
 
 // ================= FUNCIONES AUXILIARES =================
+// Normaliza la consulta (por ahora solo trim, pero podrías añadir más)
 function normalizeQuery(q) {
-  return q.toLowerCase().trim().replace(/\s+/g, ' ');
+  return q.trim();
 }
 
+// Sanitiza la consulta para evitar inyección de comandos en shell
 function safeQuery(q) {
-  // Elimina caracteres peligrosos para la shell, pero conserva acentos y ñ
+  // Elimina caracteres peligrosos: ` $ \ ; " '
   return q.replace(/[`$\\;"']/g, '');
 }
 
-function getRandomUserAgent() {
+// Devuelve un user‑agent aleatorio de la lista
+function randomUA() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
+// Ejecuta un comando y devuelve stdout como promesa
 function execPromise(cmd, timeout = REQUEST_TIMEOUT) {
   return new Promise((resolve, reject) => {
-    exec(cmd, { timeout }, (error, stdout, stderr) => {
-      if (error) {
-        reject(new Error(stderr || error.message));
-      } else {
-        resolve(stdout.trim());
-      }
+    exec(cmd, { timeout }, (err, stdout, stderr) => {
+      if (err) reject(err);
+      else resolve(stdout);
     });
   });
 }
 
-// ================= OBTENER URL DE AUDIO =================
-async function getAudioUrl(query) {
+// ================= RESOLVER YOUTUBE =================
+async function resolveYoutube(query) {
+  const ua = randomUA();
   const safeQ = safeQuery(query);
-  const ua = getRandomUserAgent();
 
-  // Intentar con cada cliente de YouTube
   for (const client of YT_CLIENTS) {
     try {
-      let cmd = `./yt-dlp -f "bestaudio[ext=m4a]/bestaudio" \
+      // Priorizamos formato m4a para mejor compatibilidad con Alexa,
+      // pero si no existe, bestaudio elige el mejor disponible.
+      const cmd = `./yt-dlp --no-playlist -f "bestaudio[ext=m4a]/bestaudio" \
         --extractor-args "youtube:player_client=${client}" \
-        --user-agent "${ua}"`;
-      if (COOKIES_FILE) cmd += ` --cookies "${COOKIES_FILE}"`;
-      cmd += ` -g "ytsearch1:${safeQ}"`;
+        --user-agent "${ua}" \
+        -g "ytsearch1:${safeQ}"`;
 
-      const url = await execPromise(cmd);
+      const stdout = await execPromise(cmd);
+      const url = stdout.trim();
       if (url) return url;
-    } catch (err) {
-      console.log(`Cliente YouTube "${client}" falló: ${err.message}`);
+    } catch (e) {
+      console.log(`Cliente YouTube "${client}" falló: ${e.message}`);
     }
   }
+  throw new Error('YouTube no devolvió URL');
+}
 
-  // Fallback: SoundCloud
+// ================= FALLBACK SOUNDCLOUD =================
+async function resolveSoundcloud(query) {
+  const safeQ = safeQuery(query);
   try {
-    let cmd = `./yt-dlp -f "bestaudio" -g "scsearch1:${safeQ}"`;
-    if (COOKIES_FILE) cmd += ` --cookies "${COOKIES_FILE}"`; // opcional, pero por si acaso
-    const url = await execPromise(cmd);
+    const cmd = `./yt-dlp --no-playlist -f "bestaudio" -g "scsearch1:${safeQ}"`;
+    const stdout = await execPromise(cmd);
+    const url = stdout.trim();
     if (url) return url;
-  } catch (err) {
-    console.log(`Fallback SoundCloud falló: ${err.message}`);
+  } catch (e) {
+    console.log('SoundCloud falló:', e.message);
   }
+  throw new Error('SoundCloud no devolvió URL');
+}
 
-  throw new Error('No se pudo obtener audio de YouTube ni SoundCloud');
+// ================= OBTENER AUDIO (con fallback) =================
+async function getAudio(query) {
+  try {
+    return await resolveYoutube(query);
+  } catch (e) {
+    console.log('YouTube falló → probando SoundCloud');
+    return await resolveSoundcloud(query);
+  }
 }
 
 // ================= ENDPOINT PRINCIPAL =================
@@ -120,30 +121,22 @@ app.get('/audio', async (req, res) => {
   const query = normalizeQuery(rawQuery);
   console.log(`🔍 Búsqueda: "${rawQuery}" → "${query}"`);
 
-  // 1. Consultar caché
+  // Consultar caché
   const cached = cache.get(query);
   if (cached) {
     console.log(`✔ Cache hit para "${query}"`);
     return res.json({ url: cached.url, cached: true });
   }
 
-  // 2. Control de concurrencia
-  if (activeRequests >= MAX_CONCURRENT) {
-    return res.status(503).json({ error: 'Demasiadas peticiones, inténtalo más tarde' });
-  }
-  activeRequests++;
-
   try {
-    // 3. Obtener URL
-    const url = await getAudioUrl(query);
+    // Ejecutar con límite de concurrencia
+    const url = await limit(() => getAudio(query));
     cache.set(query, { url, timestamp: Date.now() });
     console.log(`🎵 URL obtenida para "${query}"`);
     res.json({ url, cached: false });
   } catch (err) {
     console.error(`❌ Error para "${query}": ${err.message}`);
     res.status(500).json({ error: err.message });
-  } finally {
-    activeRequests--;
   }
 });
 
@@ -152,17 +145,16 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     cacheSize: cache.size,
-    activeRequests,
     uptime: process.uptime()
   });
 });
 
 app.get('/debug', async (req, res) => {
   try {
-    const version = await execPromise('./yt-dlp --version');
-    res.send(`yt-dlp versión: ${version}`);
-  } catch (err) {
-    res.status(500).send(`Error: ${err.message}`);
+    const out = await execPromise('./yt-dlp --version');
+    res.send(`yt-dlp versión: ${out}`);
+  } catch (e) {
+    res.status(500).send(`Error: ${e.message}`);
   }
 });
 
