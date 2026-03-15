@@ -3,10 +3,13 @@ import yt_dlp
 import os
 import tempfile
 import base64
+import time
+import threading
 
 app = Flask(__name__)
 COOKIES_FILE = None
 CACHE = {}
+CACHE_TTL = 4 * 3600  # 4 horas
 
 def init_cookies():
     global COOKIES_FILE
@@ -29,44 +32,40 @@ def init_cookies():
 init_cookies()
 
 def get_stream(query):
-    search_opts = {
-        'quiet': True,
-        'skip_download': True,
-        'extract_flat': True,
-        'noplaylist': True,
-    }
-    with yt_dlp.YoutubeDL(search_opts) as ydl:
-        r = ydl.extract_info(f'ytsearch1:{query}', download=False)
-        video_id = r['entries'][0]['id']
-        title = r['entries'][0].get('title', query)
-
-    stream_opts = {
+    ydl_opts = {
         'quiet': True,
         'skip_download': True,
         'noplaylist': True,
-        'format': 'bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best',
+        'format': '140/251/250/249/bestaudio/best',
+        'default_search': 'ytsearch1',
         'geo_bypass': True,
         'geo_bypass_country': 'US',
+        'force_ipv4': True,
     }
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-        stream_opts['cookiefile'] = COOKIES_FILE
+        ydl_opts['cookiefile'] = COOKIES_FILE
 
-    with yt_dlp.YoutubeDL(stream_opts) as ydl:
-        info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
-
-    return info['url'], info.get('title', title)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+        if 'entries' in info:
+            info = info['entries'][0]
+        return info['url'], info.get('title', query)
 
 @app.route('/audio')
 def get_audio():
-    q = request.args.get('q', '').strip()
+    q = request.args.get('q', '').strip().lower()
     if not q:
         return jsonify({'error': 'no query'}), 400
+
+    # Cache con TTL
     if q in CACHE:
-        url, title = CACHE[q]
-        return jsonify({'url': url, 'title': title, 'cached': True})
+        url, title, ts = CACHE[q]
+        if time.time() - ts < CACHE_TTL:
+            return jsonify({'url': url, 'title': title, 'cached': True})
+
     try:
         url, title = get_stream(q)
-        CACHE[q] = (url, title)
+        CACHE[q] = (url, title, time.time())
         return jsonify({'url': url, 'title': title, 'cached': False})
     except Exception as e:
         print(f"ERROR: {e}")
