@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: kimi-audio
-    env: python
-    buildCommand: |
-      apt-get update && apt-get install -y nodejs npm
-      pip install -r requirements.txt
-    startCommand: gunicorn main:app
