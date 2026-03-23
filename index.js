@@ -1,46 +1,54 @@
 const express = require('express');
 const { exec } = require('child_process');
+const { S3Client, PutObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
+app.use(express.json());
 const port = process.env.PORT || 10000;
 
-// ================= CONFIGURACIÓN =================
-const TTL              = 6 * 60 * 60 * 1000;
-const CLEANUP_INTERVAL = 10 * 60 * 1000;
-const TIMEOUT_FAST     = 20000;   // Alexa: 20s máximo
-const TIMEOUT_SLOW     = 45000;   // /bajar: 45s sin prisa
-const MAX_CONCURRENCY  = 2;
+// ================= R2 CONFIG =================
+const R2_ACCOUNT_ID  = process.env.R2_ACCOUNT_ID;
+const R2_ACCESS_KEY  = process.env.R2_ACCESS_KEY;
+const R2_SECRET_KEY  = process.env.R2_SECRET_KEY;
+const R2_BUCKET      = process.env.R2_BUCKET || 'kimi-audio';
+const R2_PUBLIC_URL  = process.env.R2_PUBLIC_URL || 'https://pub-59e0ffd74fc64fbfaf28a41cf7e8409a.r2.dev';
 
-const YT_CLIENTS = ['tv_embedded', 'tv', 'web_safari', 'web'];
+const s3 = new S3Client({
+  region: 'auto',
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: R2_ACCESS_KEY,
+    secretAccessKey: R2_SECRET_KEY,
+  },
+});
+
+// ================= CONFIG =================
+const TIMEOUT_SEARCH = 20000;
+const TIMEOUT_DL     = 120000;  // 2 min para descarga completa
+const MAX_CONCURRENT = 2;
+const TMP_DIR        = '/tmp/kimi_audio';
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15',
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1',
-  'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36'
 ];
 
-// ================= CACHÉ =================
-const cache = new Map();
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, val] of cache) {
-    if (now - val.timestamp > TTL) cache.delete(key);
-  }
-}, CLEANUP_INTERVAL);
+// Jobs en memoria (Render es stateless — Pi guarda la verdad)
+const jobs = new Map();  // jobId → { status, r2_key, url, error, youtube_id }
+let activeJobs = 0;
 
-let activeRequests = 0;
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
 // ================= HELPERS =================
-function normalizeQuery(q) { return q.trim().toLowerCase(); }
-function safeQuery(q) { return q.replace(/[`$\\;"']/g, ''); }
-function randomUA() { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
+function safeQuery(q) { return q.replace(/[`$\\;"'<>|&]/g, ''); }
+function randomUA()   { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
+function md5(str)     { return crypto.createHash('md5').update(str).digest('hex'); }
 
-function isHLS(url) {
-  return url.includes('.m3u8') || url.includes('playlist') || url.includes('m3u8');
-}
-
-function execPromise(cmd, timeout = TIMEOUT_FAST) {
+function execPromise(cmd, timeout = TIMEOUT_SEARCH) {
   return new Promise((resolve, reject) => {
     exec(cmd, { timeout }, (err, stdout) => {
       if (err) reject(err);
@@ -49,186 +57,229 @@ function execPromise(cmd, timeout = TIMEOUT_FAST) {
   });
 }
 
-// ================= YOUTUBE (anti-HLS estricto) =================
-async function resolveYoutube(query, timeout = TIMEOUT_FAST) {
-  const ua   = randomUA();
-  const safeQ = safeQuery(query);
-
-  // Formatos en orden de preferencia — todos excluyen HLS explícitamente
-  const formats = [
-    'bestaudio[ext=m4a][protocol^=https]',
-    'bestaudio[ext=mp3][protocol^=https]',
-    'bestaudio[ext=m4a]',
-    'bestaudio[ext=mp3]',
-    'bestaudio[protocol!=m3u8][protocol!=m3u8_native]',
-  ];
-
-  for (const client of YT_CLIENTS) {
-    for (const fmt of formats) {
-      try {
-        const cmd = `./yt-dlp --no-playlist \
-          -f "${fmt}" \
-          --extractor-args "youtube:player_client=${client}" \
-          --user-agent "${ua}" \
-          --geo-bypass \
-          --match-filter "!is_live" \
-          --no-warnings \
-          -g "ytsearch1:${safeQ}"`;
-
-        const url = await execPromise(cmd, timeout);
-        if (url && url.startsWith('http') && !isHLS(url)) {
-          console.log(`✅ YouTube (${client}/${fmt.split('[')[0]}): ${query}`);
-          return { url, source: `youtube_${client}` };
-        }
-      } catch (e) {
-        // Continuar con siguiente formato/cliente
-      }
-    }
-  }
-  throw new Error('YouTube no devolvió URL directa');
+function isHLS(url) {
+  return !url || url.includes('.m3u8') || url.includes('playlist.m3u8');
 }
 
-// ================= SOUNDCLOUD (forzar MP3 directo) =================
-async function resolveSoundcloud(query, timeout = TIMEOUT_FAST) {
+// ================= BUSCAR YOUTUBE ID =================
+async function findYoutubeId(query) {
   const safeQ = safeQuery(query);
+  const ua    = randomUA();
+  const YT_CLIENTS = ['tv_embedded', 'tv', 'web_safari', 'web'];
 
-  // Intentar formatos directos en orden
-  const formats = [
-    'bestaudio[ext=mp3][protocol^=https]',
-    'bestaudio[ext=mp3]',
-    'bestaudio[protocol!=m3u8][protocol!=m3u8_native][ext!=m3u8]',
-    'worstaudio[ext=mp3]',  // último recurso: peor calidad pero directo
-  ];
-
-  for (const fmt of formats) {
+  for (const client of YT_CLIENTS) {
     try {
       const cmd = `./yt-dlp --no-playlist \
-        -f "${fmt}" \
+        --extractor-args "youtube:player_client=${client}" \
+        --user-agent "${ua}" \
+        --match-filter "!is_live" \
         --no-warnings \
-        -g "scsearch1:${safeQ}"`;
-
-      const url = await execPromise(cmd, timeout);
-      if (url && url.startsWith('http') && !isHLS(url)) {
-        console.log(`✅ SoundCloud (${fmt.split('[')[0]}): ${query}`);
-        return { url, source: 'soundcloud' };
+        --get-id "ytsearch1:${safeQ}"`;
+      const ytId = await execPromise(cmd, TIMEOUT_SEARCH);
+      if (ytId && ytId.length === 11) {
+        console.log(`✅ YouTube ID (${client}): ${ytId} para "${query}"`);
+        return ytId;
       }
     } catch (e) {
-      // Continuar
+      console.log(`YouTube ${client} falló: ${e.message.slice(0, 60)}`);
     }
   }
 
-  // Último intento: URL directa sin filtro de formato pero verificar que no es HLS
+  // Fallback: SoundCloud — devolver URL directa en lugar de ID
   try {
-    const cmd = `./yt-dlp --no-playlist --no-warnings -g "scsearch1:${safeQ}"`;
-    const stdout = await execPromise(cmd, timeout);
-    const urls = stdout.split('\n').filter(u => u.startsWith('http'));
-    const directUrl = urls.find(u => !isHLS(u));
-    if (directUrl) {
-      console.log(`✅ SoundCloud (directo): ${query}`);
-      return { url: directUrl, source: 'soundcloud_direct' };
+    const cmd = `./yt-dlp --no-playlist --no-warnings \
+      -f "bestaudio[ext=mp3]/bestaudio[protocol!=m3u8]" \
+      -g "scsearch1:${safeQ}"`;
+    const url = await execPromise(cmd, TIMEOUT_SEARCH);
+    if (url && url.startsWith('http') && !isHLS(url)) {
+      return { type: 'direct_url', url, source: 'soundcloud' };
     }
   } catch (e) {}
 
-  throw new Error('SoundCloud no devolvió MP3 directo');
+  throw new Error('No se encontró la canción en YouTube ni SoundCloud');
 }
 
-// ================= OBTENER AUDIO =================
-async function getAudio(query, slow = false) {
-  const timeout = slow ? TIMEOUT_SLOW : TIMEOUT_FAST;
+// ================= DESCARGAR Y SUBIR A R2 =================
+async function downloadAndUpload(youtubeIdOrObj, jobId) {
+  const tmpFile = path.join(TMP_DIR, `${jobId}.mp3`);
 
-  // Para /bajar (slow=true): YouTube primero con más tiempo
-  // Para Alexa (slow=false): SoundCloud primero (más rápido)
-  if (slow) {
-    try { return await resolveYoutube(query, timeout); } catch (e) {
-      console.log('YouTube falló → SoundCloud');
+  try {
+    let r2Key, publicUrl, source;
+
+    if (typeof youtubeIdOrObj === 'object' && youtubeIdOrObj.type === 'direct_url') {
+      // SoundCloud URL directa — descargar con wget
+      const { url, source: src } = youtubeIdOrObj;
+      source = src;
+      r2Key  = `songs/${md5(url)}.mp3`;
+
+      console.log(`⬇️ Descargando SoundCloud directo...`);
+      await execPromise(`wget -q -O "${tmpFile}" "${url}"`, TIMEOUT_DL);
+
+    } else {
+      // YouTube ID — descargar con yt-dlp
+      const ytId = youtubeIdOrObj;
+      source = 'youtube';
+      r2Key  = `songs/${md5(ytId)}.mp3`;
+
+      // Comprobar si ya existe en R2
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: r2Key }));
+        publicUrl = `${R2_PUBLIC_URL}/${r2Key}`;
+        console.log(`✅ Ya existe en R2: ${r2Key}`);
+        return { r2Key, url: publicUrl, source: 'r2_cached' };
+      } catch (_) {}
+
+      console.log(`⬇️ Descargando YouTube ${ytId}...`);
+      const ua  = randomUA();
+      const cmd = `./yt-dlp --no-playlist \
+        -f "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio" \
+        --extract-audio --audio-format mp3 --audio-quality 5 \
+        --user-agent "${ua}" \
+        --no-warnings \
+        -o "${tmpFile.replace('.mp3', '.%(ext)s')}" \
+        "https://www.youtube.com/watch?v=${ytId}"`;
+      await execPromise(cmd, TIMEOUT_DL);
+
+      // yt-dlp puede guardar como .m4a → buscar archivo real
+      const possibleFiles = [tmpFile, tmpFile.replace('.mp3', '.m4a'), tmpFile.replace('.mp3', '.webm')];
+      const existingFile  = possibleFiles.find(f => fs.existsSync(f));
+      if (!existingFile) throw new Error('Archivo descargado no encontrado');
+      if (existingFile !== tmpFile) fs.renameSync(existingFile, tmpFile);
     }
-    try { return await resolveSoundcloud(query, timeout); } catch (e) {}
-  } else {
-    try { return await resolveSoundcloud(query, timeout); } catch (e) {
-      console.log('SoundCloud falló → YouTube');
-    }
-    try { return await resolveYoutube(query, timeout); } catch (e) {}
+
+    // Subir a R2
+    if (!r2Key) throw new Error('r2Key no definido');
+    console.log(`☁️ Subiendo a R2: ${r2Key}`);
+    const fileBuffer = fs.readFileSync(tmpFile);
+    await s3.send(new PutObjectCommand({
+      Bucket:      R2_BUCKET,
+      Key:         r2Key,
+      Body:        fileBuffer,
+      ContentType: 'audio/mpeg',
+    }));
+
+    publicUrl = `${R2_PUBLIC_URL}/${r2Key}`;
+    console.log(`✅ Subido: ${publicUrl}`);
+    return { r2Key, url: publicUrl, source };
+
+  } finally {
+    // Limpiar archivo temporal
+    if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
   }
-
-  throw new Error(`No se encontró URL directa para: ${query}`);
 }
 
-// ================= ENDPOINT /audio (Alexa — rápido) =================
+// ================= PROCESAR JOB =================
+async function processJob(jobId, query, youtubeId = null) {
+  jobs.set(jobId, { status: 'processing', query });
+  activeJobs++;
+
+  try {
+    // Si no tenemos youtube_id, buscarlo
+    const target = youtubeId || await findYoutubeId(query);
+
+    // Descargar y subir a R2
+    const result = await downloadAndUpload(target, jobId);
+
+    jobs.set(jobId, {
+      status:    'ready',
+      query,
+      r2_key:    result.r2Key,
+      url:       result.url,
+      source:    result.source,
+      youtube_id: typeof target === 'string' ? target : null,
+      done_at:   Date.now(),
+    });
+    console.log(`✅ Job ${jobId} completado: ${result.url}`);
+
+  } catch (e) {
+    console.error(`❌ Job ${jobId} falló: ${e.message}`);
+    jobs.set(jobId, { status: 'failed', query, error: e.message, done_at: Date.now() });
+  } finally {
+    activeJobs--;
+    // Limpiar jobs viejos (>2h)
+    const cutoff = Date.now() - 2 * 3600 * 1000;
+    for (const [id, job] of jobs) {
+      if (job.done_at && job.done_at < cutoff) jobs.delete(id);
+    }
+  }
+}
+
+// ================= ENDPOINTS =================
+
+// POST /process — lanzar job async (Pi no espera)
+app.post('/process', async (req, res) => {
+  const { query, youtube_id, job_id } = req.body;
+  if (!query) return res.status(400).json({ error: 'Falta query' });
+
+  if (activeJobs >= MAX_CONCURRENT)
+    return res.status(429).json({ error: 'Servidor ocupado', retry_after: 30 });
+
+  const jobId = job_id || `job_${Date.now()}_${md5(query).slice(0, 8)}`;
+
+  // Responder inmediatamente — job corre en background
+  res.json({ job_id: jobId, status: 'processing' });
+
+  // Lanzar procesamiento async
+  processJob(jobId, query, youtube_id).catch(e => console.error(e));
+});
+
+// GET /status/:jobId — Pi hace polling cada 30s
+app.get('/status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job no encontrado' });
+  res.json(job);
+});
+
+// GET /audio — búsqueda rápida URL directa (para Alexa con cache R2)
+// Si Pi tiene r2_key en SQLite, no llama a este endpoint
+// Solo se usa como fallback
 app.get('/audio', async (req, res) => {
-  const rawQuery = (req.query.q || '').trim();
-  if (!rawQuery) return res.status(400).json({ error: 'Falta parámetro q' });
+  const query = (req.query.q || '').trim();
+  if (!query) return res.status(400).json({ error: 'Falta q' });
 
-  const query = normalizeQuery(rawQuery);
-  const cached = cache.get(query);
-  if (cached && !isHLS(cached.url)) {
-    return res.json({ url: cached.url, title: cached.title, source: cached.source, cached: true });
-  }
+  if (activeJobs >= MAX_CONCURRENT)
+    return res.status(429).json({ error: 'Servidor ocupado' });
 
-  if (activeRequests >= MAX_CONCURRENCY)
-    return res.status(429).json({ error: 'Demasiadas peticiones' });
-
-  activeRequests++;
+  const jobId = `quick_${md5(query).slice(0, 8)}`;
+  activeJobs++;
   try {
-    const result = await getAudio(query, false);
-    let title = rawQuery;
+    const target = await findYoutubeId(safeQuery(query));
+    if (typeof target === 'object' && target.type === 'direct_url') {
+      return res.json({ url: target.url, source: target.source, cached: false });
+    }
+    // Devolver URL de R2 si ya existe
+    const r2Key = `songs/${md5(target)}.mp3`;
     try {
-      title = await execPromise(`./yt-dlp --no-warnings --get-title "scsearch1:${safeQuery(query)}"`, 8000);
+      await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: r2Key }));
+      return res.json({ url: `${R2_PUBLIC_URL}/${r2Key}`, source: 'r2', cached: true });
     } catch (_) {}
-    cache.set(query, { url: result.url, title, source: result.source, timestamp: Date.now() });
-    res.json({ url: result.url, title, source: result.source, cached: false });
+    // No está en R2 — devolver error para que Pi lance job
+    res.status(202).json({ status: 'not_cached', youtube_id: target, message: 'Use /process' });
   } catch (e) {
-    console.error(`❌ /audio error: ${e.message}`);
     res.status(500).json({ error: e.message });
   } finally {
-    activeRequests--;
+    activeJobs--;
   }
 });
 
-// ================= ENDPOINT /download (sin prisa — YouTube primero) =================
-app.get('/download', async (req, res) => {
-  const rawQuery = (req.query.q || '').trim();
-  if (!rawQuery) return res.status(400).json({ error: 'Falta parámetro q' });
-
-  const query = normalizeQuery(rawQuery);
-
-  // Cache hit válido
-  const cached = cache.get(query);
-  if (cached && !isHLS(cached.url)) {
-    return res.json({ url: cached.url, title: cached.title, source: cached.source, cached: true });
-  }
-
-  activeRequests++;
-  try {
-    // Sin límite de concurrencia para descargas — son asíncronas desde KIMI
-    const result = await getAudio(query, true);  // slow=true → YouTube primero
-    let title = rawQuery;
-    try {
-      const src = result.source.startsWith('youtube') ? 'ytsearch1' : 'scsearch1';
-      title = await execPromise(`./yt-dlp --no-warnings --get-title "${src}:${safeQuery(query)}"`, 10000);
-    } catch (_) {}
-    cache.set(query, { url: result.url, title, source: result.source, timestamp: Date.now() });
-    res.json({ url: result.url, title, source: result.source, cached: false });
-  } catch (e) {
-    console.error(`❌ /download error: ${e.message}`);
-    res.status(500).json({ error: e.message });
-  } finally {
-    activeRequests--;
-  }
-});
-
-// ================= ENDPOINTS UTILIDAD =================
+// GET /health
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', cacheSize: cache.size, active: activeRequests, uptime: Math.floor(process.uptime()) });
+  res.json({
+    status:     'ok',
+    activeJobs,
+    pendingJobs: [...jobs.values()].filter(j => j.status === 'processing').length,
+    uptime:     Math.floor(process.uptime()),
+  });
 });
 
+// GET /debug
 app.get('/debug', async (req, res) => {
   try {
     const version = await execPromise('./yt-dlp --version', 5000);
-    res.json({ yt_dlp: version, node: process.version });
+    res.json({ yt_dlp: version, node: process.version, r2_configured: !!R2_ACCESS_KEY });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ================= START =================
-app.listen(port, () => console.log(`🚀 kimi-audio en puerto ${port}`));
+app.listen(port, () => console.log(`🚀 kimi-audio R2 en puerto ${port}`));
