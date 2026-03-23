@@ -23,58 +23,36 @@ const s3 = new S3Client({
 
 const jobs = new Map();
 
-// Instancias Invidious públicas (rotar si falla)
-const INVIDIOUS_INSTANCES = [
-  'https://invidious.privacydev.net',
-  'https://inv.nadeko.net',
-  'https://invidious.nerdvpn.de',
-  'https://invidious.perennialte.ch',
-  'https://yt.cdaut.de',
-  'https://invidious.ducks.party',
-  'https://invidious.io.lol',
-  'https://iv.melmac.space',
+const USER_AGENTS = [
+  'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+  'com.google.android.youtube/17.31.35 (Linux; U; Android 12) gzip',
+  'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 Chrome/112.0 Mobile Safari/537.36',
 ];
 
 function safeQ(q)   { return q.replace(/[`$\\;"'<>]/g, ''); }
 function md5(s)     { return crypto.createHash('md5').update(s).digest('hex'); }
 function isHLS(url) { return !url || url.includes('.m3u8'); }
+function randUA()   { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
+function sleep(ms)  { return new Promise(r => setTimeout(r, ms)); }
 
-function run(cmd, timeout = 15000) {
+function run(cmd, timeout = 30000) {
   return new Promise((resolve, reject) => {
     exec(cmd, { timeout }, (err, stdout, stderr) => {
-      if (err) reject(new Error(stderr?.slice(0, 200) || err.message));
+      if (err) reject(new Error(stderr?.slice(0, 300) || err.message));
       else resolve(stdout.trim());
     });
-  });
-}
-
-function fetchJson(url, timeout = 10000) {
-  return new Promise((resolve, reject) => {
-    const proto = url.startsWith('https') ? https : http;
-    const req = proto.get(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120.0' },
-      timeout,
-    }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('JSON inválido')); }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
   });
 }
 
 function fetchBuffer(url, timeout = 55000) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    const proto = url.startsWith('https') ? https : http;
-    const req = proto.get(url, {
+    const proto  = url.startsWith('https') ? https : http;
+    const req    = proto.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 Chrome/120.0',
-        'Referer': 'https://www.youtube.com/',
+        'User-Agent': randUA(),
+        'Referer':    'https://www.youtube.com/',
+        'Origin':     'https://www.youtube.com',
       },
       timeout,
     }, (res) => {
@@ -83,7 +61,7 @@ function fetchBuffer(url, timeout = 55000) {
         return;
       }
       if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode} descargando audio`));
+        reject(new Error(`HTTP ${res.statusCode}`));
         return;
       }
       res.on('data', c => chunks.push(c));
@@ -91,81 +69,72 @@ function fetchBuffer(url, timeout = 55000) {
       res.on('error', reject);
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout descarga')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
   });
 }
 
-// ── Buscar video en Invidious ──────────────────────────────────────
-async function searchInvidious(query, instance) {
-  const url = `${instance}/api/v1/search?q=${encodeURIComponent(query)}&type=video&fields=videoId,title,lengthSeconds`;
-  const data = await fetchJson(url, 8000);
-  if (!Array.isArray(data) || data.length === 0) throw new Error('Sin resultados');
-  // Filtrar lives y videos muy cortos/largos
-  const video = data.find(v =>
-    v.videoId && v.lengthSeconds > 60 && v.lengthSeconds < 600
-  ) || data[0];
-  return video.videoId;
-}
+// ── Estrategias para obtener URL directa ─────────────────────────
+async function getDirectUrl(query) {
+  const q  = safeQ(query);
+  const ua = randUA();
 
-// ── Obtener URL de audio desde Invidious ─────────────────────────
-async function getAudioUrlInvidious(videoId, instance) {
-  const url = `${instance}/api/v1/videos/${videoId}?fields=adaptiveFormats,formatStreams`;
-  const data = await fetchJson(url, 10000);
-
-  // Buscar formato de audio directo (no HLS)
-  const formats = [
-    ...(data.adaptiveFormats || []),
-    ...(data.formatStreams   || []),
+  const strategies = [
+    // 1. YouTube cliente android (evita bot-check en 2026)
+    {
+      name: 'yt_android',
+      cmd: `./yt-dlp --no-playlist --no-warnings \
+        -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
+        --extractor-args "youtube:player_client=android" \
+        --user-agent "${ua}" \
+        --sleep-interval 2 --max-sleep-interval 5 \
+        --no-check-certificate \
+        -g "ytsearch1:${q}"`,
+    },
+    // 2. YouTube cliente android_music
+    {
+      name: 'yt_android_music',
+      cmd: `./yt-dlp --no-playlist --no-warnings \
+        -f "bestaudio" \
+        --extractor-args "youtube:player_client=android_music" \
+        --user-agent "${ua}" \
+        --sleep-interval 2 \
+        --no-check-certificate \
+        -g "ytsearch1:${q}"`,
+    },
+    // 3. YouTube cliente mweb
+    {
+      name: 'yt_mweb',
+      cmd: `./yt-dlp --no-playlist --no-warnings \
+        -f "bestaudio[protocol!=m3u8]" \
+        --extractor-args "youtube:player_client=mweb" \
+        --user-agent "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36" \
+        -g "ytsearch1:${q}"`,
+    },
+    // 4. SoundCloud con device_id aleatorio
+    {
+      name: 'soundcloud',
+      cmd: `./yt-dlp --no-playlist --no-warnings \
+        -f "bestaudio[ext=mp3]/bestaudio[protocol!=m3u8]" \
+        --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0" \
+        -g "scsearch1:${q}"`,
+    },
   ];
 
-  // Preferir audio/mp4 o audio/webm sin HLS
-  const audioFmt = formats
-    .filter(f => f.url && !isHLS(f.url) &&
-      (f.type?.includes('audio') || f.itag === 140 || f.itag === 251))
-    .sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
-
-  if (audioFmt?.url) return audioFmt.url;
-
-  // Fallback: cualquier formato con URL directa
-  const anyFmt = formats.find(f => f.url && !isHLS(f.url));
-  if (anyFmt?.url) return anyFmt.url;
-
-  throw new Error('No hay formato de audio directo');
-}
-
-// ── Flujo completo: buscar → URL → buffer → R2 ────────────────────
-async function getAudioViaInvidious(query) {
-  for (const instance of INVIDIOUS_INSTANCES) {
+  for (const s of strategies) {
     try {
-      console.log(`🔍 Buscando en ${instance}...`);
-      const videoId = await searchInvidious(query, instance);
-      console.log(`🎬 VideoId: ${videoId}`);
-      const audioUrl = await getAudioUrlInvidious(videoId, instance);
-      console.log(`🎵 URL audio: ${audioUrl.slice(0, 80)}`);
-      return { audioUrl, videoId, instance };
+      await sleep(1000 + Math.random() * 2000); // pausa anti-bot
+      const out  = await run(s.cmd, 25000);
+      const urls = out.split('\n').map(u => u.trim()).filter(u => u.startsWith('http'));
+      const url  = urls.find(u => !isHLS(u));
+      if (url) {
+        console.log(`✅ [${s.name}] URL obtenida: ${url.slice(0, 70)}`);
+        return { url, source: s.name };
+      }
     } catch (e) {
-      console.log(`⚠️ ${instance}: ${e.message.slice(0, 80)}`);
+      console.log(`⚠️ [${s.name}]: ${e.message.slice(0, 100)}`);
     }
   }
-  throw new Error('Todas las instancias Invidious fallaron');
-}
-
-// ── ytdlp como último fallback ────────────────────────────────────
-async function getUrlYtdlp(query) {
-  const q  = safeQ(query);
-  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36';
-  const cmds = [
-    `./yt-dlp --no-playlist --no-warnings -f "bestaudio[protocol!=m3u8]" --extractor-args "youtube:player_client=tv_embedded" --user-agent "${ua}" -g "ytsearch1:${q}"`,
-    `./yt-dlp --no-playlist --no-warnings -f "bestaudio[protocol!=m3u8]" --user-agent "${ua}" -g "scsearch1:${q}"`,
-  ];
-  for (const cmd of cmds) {
-    try {
-      const out = await run(cmd, 15000);
-      const url = out.split('\n').find(u => u.startsWith('http') && !isHLS(u));
-      if (url) return url;
-    } catch (_) {}
-  }
-  return null;
+  throw new Error('Todas las estrategias fallaron');
 }
 
 // ── Procesar job ──────────────────────────────────────────────────
@@ -185,31 +154,14 @@ async function processJob(jobId, query) {
       return;
     } catch (_) {}
 
-    // 1. Invidious (principal)
-    let audioUrl = null;
-    let source   = 'invidious';
-    let videoId  = '';
-    try {
-      const res = await getAudioViaInvidious(query);
-      audioUrl = res.audioUrl;
-      videoId  = res.videoId;
-    } catch (e) {
-      console.log(`⚠️ Invidious falló: ${e.message} → probando ytdlp`);
-    }
-
-    // 2. yt-dlp fallback
-    if (!audioUrl) {
-      audioUrl = await getUrlYtdlp(query);
-      source   = 'ytdlp_direct';
-    }
-
-    if (!audioUrl) throw new Error('No se encontró URL de audio por ninguna vía');
+    // Obtener URL directa
+    const { url: audioUrl, source } = await getDirectUrl(query);
 
     // Descargar buffer
-    console.log(`⬇️ Descargando audio...`);
+    console.log(`⬇️ Descargando...`);
     const buf = await fetchBuffer(audioUrl);
     console.log(`📦 ${(buf.length / 1024 / 1024).toFixed(1)} MB`);
-    if (buf.length < 50000) throw new Error(`Audio demasiado pequeño (${buf.length} bytes)`);
+    if (buf.length < 50000) throw new Error(`Audio demasiado pequeño: ${buf.length} bytes`);
 
     // Subir a R2
     await s3.send(new PutObjectCommand({
@@ -219,12 +171,12 @@ async function processJob(jobId, query) {
 
     const r2Url = `${R2_PUBLIC_URL}/${r2Key}`;
     jobs.set(jobId, { status: 'ready', query, r2_key: r2Key, r2_url: r2Url,
-                      youtube_id: videoId, source, title: query, done_at: Date.now() });
-    console.log(`✅ Job listo: ${jobId} → ${r2Url}`);
+                      source, title: query, done_at: Date.now() });
+    console.log(`✅ Listo: ${jobId} → ${r2Url}`);
 
   } catch (e) {
     jobs.set(jobId, { status: 'failed', query, error: e.message, done_at: Date.now() });
-    console.error(`❌ Job ${jobId} falló: ${e.message}`);
+    console.error(`❌ ${jobId} falló: ${e.message}`);
   }
 }
 
@@ -250,18 +202,29 @@ app.get('/status/:jobId', (req, res) => {
   res.json(job);
 });
 
-// /audio — URL directa rápida sin R2 (para Alexa urgente)
+// /audio — URL directa sin R2 para Alexa urgente
 app.get('/audio', async (req, res) => {
   const q = (req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'Falta q' });
   try {
-    const { audioUrl, videoId } = await getAudioViaInvidious(q);
-    return res.json({ url: audioUrl, source: 'invidious', cached: false });
-  } catch (_) {}
-  // Fallback ytdlp
-  const url = await getUrlYtdlp(q);
-  if (url) return res.json({ url, source: 'ytdlp', cached: false });
-  res.status(500).json({ error: 'No se encontró URL' });
+    const { url, source } = await getDirectUrl(q);
+    res.json({ url, source, cached: false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// /precache — batch nocturno (lista de canciones)
+app.post('/precache', async (req, res) => {
+  const { songs = [], batch_id } = req.body;
+  if (!songs.length) return res.status(400).json({ error: 'Lista vacía' });
+  const batchId = batch_id || crypto.randomUUID().slice(0, 8);
+  const jobIds  = songs.map((s, i) => {
+    const jobId = `${batchId}_${i}`;
+    setTimeout(() => processJob(jobId, s), i * 8000); // espaciar 8s entre jobs
+    return { song: s, job_id: jobId };
+  });
+  res.json({ batch_id: batchId, total: songs.length, jobs: jobIds });
 });
 
 app.get('/health', (req, res) =>
@@ -270,28 +233,22 @@ app.get('/health', (req, res) =>
 app.get('/debug', async (req, res) => {
   try {
     const ver = await run('./yt-dlp --version', 5000);
-    let r2ok = false;
+    let r2ok  = false;
     try { await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: '_test' })); r2ok = true; }
     catch (e) { r2ok = e.$metadata?.httpStatusCode === 404; }
     res.json({ yt_dlp: ver, node: process.version, r2_configured: !!R2_ACCESS_KEY, r2_ok: r2ok });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Test Invidious
-app.get('/debug/invidious', async (req, res) => {
-  const q = (req.query.q || 'bohemian rhapsody').trim();
-  const results = [];
-  for (const inst of INVIDIOUS_INSTANCES.slice(0, 3)) {
-    try {
-      const vid = await searchInvidious(q, inst);
-      const url = await getAudioUrlInvidious(vid, inst);
-      results.push({ instance: inst, videoId: vid, url: url.slice(0, 80), ok: true });
-      break;
-    } catch (e) {
-      results.push({ instance: inst, error: e.message, ok: false });
-    }
+// Test rápido de una estrategia
+app.get('/debug/strategy', async (req, res) => {
+  const q = (req.query.q || 'bohemian rhapsody queen').trim();
+  try {
+    const result = await getDirectUrl(q);
+    res.json({ ok: true, url: result.url.slice(0, 100), source: result.source });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
   }
-  res.json(results);
 });
 
-app.listen(port, () => console.log(`🚀 kimi-audio R2+Invidious en puerto ${port}`));
+app.listen(port, () => console.log(`🚀 kimi-audio android+R2 en puerto ${port}`));
