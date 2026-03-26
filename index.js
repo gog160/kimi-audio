@@ -2,6 +2,7 @@
 // Estrategias: android/android_music/mweb + Piped validado + SoundCloud
 // Sin ffmpeg: formato forzado m4a/mp3 desde yt-dlp
 // R2 persistente + PostgreSQL para cola + Telegram notificación
+// Nueva funcionalidad: endpoint /canciones con paginación (query_text incluido)
 
 import express  from 'express';
 import { exec } from 'child_process';
@@ -45,6 +46,7 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS url_cache (
       query_hash TEXT PRIMARY KEY,
+      query_text TEXT,                -- 👈 NUEVO: nombre de la canción
       r2_url     TEXT,
       source     TEXT,
       ts         BIGINT
@@ -273,7 +275,6 @@ async function getDirectUrl(query) {
 }
 
 // ====================== DESCARGA CON LÍMITE DE TAMAÑO ======================
-// PUNTO 2: Descarga con límite de tamaño DURANTE el stream (aborta antes de agotar RAM)
 function downloadBufferLimited(url, maxSizeMB = 30, timeout = 55000) {
   const maxBytes = maxSizeMB * 1024 * 1024;
   return new Promise((resolve, reject) => {
@@ -350,10 +351,12 @@ async function processJob(query, chatId) {
     try {
       await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: tryKey }));
       const r2Url = `${R2_PUBLIC_URL}/${tryKey}`;
+      // Guardar en caché (incluye query_text)
       await pool.query(
-        `INSERT INTO url_cache VALUES ($1,$2,$3,$4)
-         ON CONFLICT (query_hash) DO UPDATE SET r2_url=$2, ts=$4`,
-        [hash, r2Url, 'r2_existing', Date.now()]
+        `INSERT INTO url_cache (query_hash, query_text, r2_url, source, ts)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (query_hash) DO UPDATE SET r2_url=$3, source=$4, ts=$5, query_text=$2`,
+        [hash, query, r2Url, 'r2_existing', Date.now()]
       );
       await tgSend(chatId, `✅ *${query}* ya estaba lista.\nURL: ${r2Url}\nDi a Alexa: _pon ${query}_`);
       return r2Url;
@@ -363,7 +366,7 @@ async function processJob(query, chatId) {
   // Obtener URL directa
   const { url: audioUrl, source } = await getDirectUrl(query);
 
-  // PUNTO 2: Descargar con límite de tamaño durante el stream (no después)
+  // Descargar con límite de tamaño
   console.log(`⬇️ Descargando ${query}...`);
   const buf = await downloadBufferLimited(audioUrl, 20);
   console.log(`📦 ${(buf.length / 1024 / 1024).toFixed(1)} MB`);
@@ -371,12 +374,11 @@ async function processJob(query, chatId) {
   if (buf.length < 50000)
     throw new Error(`Archivo demasiado pequeño: ${buf.length} bytes`);
 
-  // PUNTO 1: Detectar extensión real desde la URL
+  // Detectar extensión real y subir a R2
   const finalExt  = detectExtension(audioUrl);
   const finalKey  = `songs/${hash}.${finalExt}`;
   const contentType = extToContentType(finalExt);
 
-  // Subir a R2 con extensión correcta
   await s3.send(new PutObjectCommand({
     Bucket:      R2_BUCKET,
     Key:         finalKey,
@@ -386,14 +388,15 @@ async function processJob(query, chatId) {
   }));
   const r2Url = `${R2_PUBLIC_URL}/${finalKey}`;
 
-  // Guardar en PostgreSQL
+  // Guardar en PostgreSQL con query_text
   await pool.query(
-    `INSERT INTO url_cache VALUES ($1,$2,$3,$4)
-     ON CONFLICT (query_hash) DO UPDATE SET r2_url=$2, source=$3, ts=$4`,
-    [hash, r2Url, source, Date.now()]
+    `INSERT INTO url_cache (query_hash, query_text, r2_url, source, ts)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (query_hash) DO UPDATE SET r2_url=$3, source=$4, ts=$5, query_text=$2`,
+    [hash, query, r2Url, source, Date.now()]
   );
 
-  // Notificar por Telegram — INCLUYE URL para que Kimi la capture y cachée localmente
+  // Notificar por Telegram
   await tgSend(chatId,
     `🎵 *${query}* lista.\nURL: ${r2Url}\nFuente: \`${source}\` | _Di a Alexa: pon ${query}_`
   );
@@ -441,6 +444,7 @@ async function runWorker() {
   }
   activeJobs--;
 }
+
 // ====================== MONITOR DE MEMORIA ======================
 const RAM_WARN_MB  = 350;  // Avisar en log
 const RAM_PAUSE_MB = 430;  // Pausar nuevos jobs (límite Render free ~512MB)
@@ -453,7 +457,6 @@ function checkMemory() {
   const ram = getRamMB();
   if (ram > RAM_PAUSE_MB) {
     console.error(`🚨 RAM CRÍTICA: ${ram.toFixed(0)}MB — pausando jobs y forzando GC`);
-    // Forzar GC si está disponible (node --expose-gc)
     if (global.gc) global.gc();
   } else if (ram > RAM_WARN_MB) {
     console.warn(`⚠️ RAM alta: ${ram.toFixed(0)}MB`);
@@ -461,9 +464,8 @@ function checkMemory() {
   }
   return ram;
 }
-setInterval(checkMemory, 30000);  // Revisar cada 30s
+setInterval(checkMemory, 30000);
 
-// Worker con protección RAM
 async function runWorkerSafe() {
   const ram = getRamMB();
   if (ram > RAM_PAUSE_MB) {
@@ -484,10 +486,10 @@ app.post('/precache', async (req, res) => {
   const hash = md5(query.toLowerCase().trim());
   try {
     const cached = await pool.query(
-      `SELECT r2_url FROM url_cache WHERE query_hash=$1`, [hash]
+      `SELECT r2_url, query_text FROM url_cache WHERE query_hash=$1`, [hash]
     );
     if (cached.rows.length) {
-      return res.json({ status: 'ready', url: cached.rows[0].r2_url, source: 'cache' });
+      return res.json({ status: 'ready', url: cached.rows[0].r2_url, query_text: cached.rows[0].query_text, source: 'cache' });
     }
     await pool.query(
       `INSERT INTO queue (query, chat_id) VALUES ($1, $2)`,
@@ -506,11 +508,28 @@ app.get('/get', async (req, res) => {
   const hash = md5(q.toLowerCase().trim());
   try {
     const r = await pool.query(
-      `SELECT r2_url, source FROM url_cache WHERE query_hash=$1`, [hash]
+      `SELECT r2_url, source, query_text FROM url_cache WHERE query_hash=$1`, [hash]
     );
-    if (r.rows.length) return res.json({ url: r.rows[0].r2_url, source: r.rows[0].source });
+    if (r.rows.length) return res.json({ url: r.rows[0].r2_url, source: r.rows[0].source, query_text: r.rows[0].query_text });
     res.status(404).json({ error: 'not in cache' });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /canciones — lista paginada de canciones (para Kimi)
+app.get('/canciones', async (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit) || 100, 500);
+  const offset = parseInt(req.query.offset) || 0;
+  const order  = req.query.order === 'asc' ? 'ASC' : 'DESC';
+  try {
+    const r = await pool.query(
+      `SELECT query_text, r2_url, source, ts FROM url_cache ORDER BY ts ${order} LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    const t = await pool.query('SELECT COUNT(*) FROM url_cache');
+    res.json({ songs: r.rows, total: parseInt(t.rows[0].count) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /audio — URL directa rápida para Alexa (sin R2, fallback urgente)
