@@ -2,7 +2,7 @@
 // Estrategias: android/android_music/mweb + Piped validado + SoundCloud
 // Sin ffmpeg: formato forzado m4a/mp3 desde yt-dlp
 // R2 persistente + PostgreSQL para cola + Telegram notificación
-// Nuevo endpoint /canciones con paginación y COALESCE para query_text
+// Endpoint /canciones con paginación y auto‑reparación de nombres
 
 import express  from 'express';
 import { exec } from 'child_process';
@@ -98,7 +98,6 @@ function isValidAudioUrl(url) {
   if (!url || !url.startsWith('http')) return false;
   if (url.includes('.m3u8'))   return false;  // HLS → Alexa no acepta
   if (url.includes('manifest')) return false; // fragmentado
-  // Formatos aceptados por Alexa
   const ok = url.includes('.mp3') || url.includes('.m4a') ||
              url.includes('.aac') || url.includes('mime=audio') ||
              url.includes('googlevideo.com') ||  // YouTube directo
@@ -140,12 +139,9 @@ async function getDirectUrl(query) {
   const q  = safeQ(query);
   const ua = randUA();
 
-  // Formato seguro para Alexa: m4a o mp3, sin HLS, bitrate limitado
   const YT_FORMAT = '"bestaudio[ext=m4a][abr<=160]/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio[ext=webm][protocol!=m3u8]"';
 
   const strategies = [
-
-    // 1. Android client — mejor anti-bot en 2026
     {
       name: 'yt_android',
       run: async () => {
@@ -162,8 +158,6 @@ async function getDirectUrl(query) {
         return out.split('\n').find(u => isValidAudioUrl(u));
       },
     },
-
-    // 2. Android Music client
     {
       name: 'yt_android_music',
       run: async () => {
@@ -180,8 +174,6 @@ async function getDirectUrl(query) {
         return out.split('\n').find(u => isValidAudioUrl(u));
       },
     },
-
-    // 3. mweb client
     {
       name: 'yt_mweb',
       run: async () => {
@@ -196,15 +188,12 @@ async function getDirectUrl(query) {
         return out.split('\n').find(u => isValidAudioUrl(u));
       },
     },
-
-    // 4. Piped API — proxy YouTube, sin yt-dlp, pero validación estricta
     {
       name: 'piped',
       run: async () => {
         for (const inst of pipedInstances.slice(0, 6)) {
           if (pipedHealth.get(inst) === false) continue;
           try {
-            // Buscar video ID
             const sr = await fetch(
               `${inst}/search?q=${encodeURIComponent(query)}&filter=music_songs`,
               { signal: AbortSignal.timeout(6000) }
@@ -214,14 +203,12 @@ async function getDirectUrl(query) {
             const vid = sd.items?.[0]?.url?.split('watch?v=')?.[1]?.split('&')?.[0];
             if (!vid) continue;
 
-            // Obtener streams del video
             const vr = await fetch(`${inst}/streams/${vid}`,
               { signal: AbortSignal.timeout(8000) }
             );
             if (!vr.ok) continue;
             const vd = await vr.json();
 
-            // Filtrar audio válido: preferir m4a/mp3, excluir HLS y fragmentados
             const best = (vd.audioStreams || [])
               .filter(s => isValidAudioUrl(s.url) &&
                            (s.mimeType?.includes('audio/mp4') ||
@@ -240,8 +227,6 @@ async function getDirectUrl(query) {
         return null;
       },
     },
-
-    // 5. SoundCloud — mp3 directo, sin problemas de bot
     {
       name: 'soundcloud',
       run: async () => {
@@ -255,7 +240,6 @@ async function getDirectUrl(query) {
         return out.split('\n').find(u => isValidAudioUrl(u));
       },
     },
-
   ];
 
   for (const s of strategies) {
@@ -301,7 +285,7 @@ function downloadBufferLimited(url, maxSizeMB = 30, timeout = 55000) {
         totalBytes += chunk.length;
         if (totalBytes > maxBytes) {
           req.destroy();
-          chunks.length = 0;  // Liberar memoria inmediatamente
+          chunks.length = 0;
           reject(new Error(`Archivo supera ${maxSizeMB} MB (${(totalBytes/1024/1024).toFixed(1)} MB)`));
           return;
         }
@@ -309,11 +293,11 @@ function downloadBufferLimited(url, maxSizeMB = 30, timeout = 55000) {
       });
       res.on('end', () => {
         const buf = Buffer.concat(chunks);
-        chunks.length = 0;  // Liberar array de chunks
+        chunks.length = 0;
         resolve(buf);
       });
       res.on('error', (err) => {
-        chunks.length = 0;  // Liberar en error
+        chunks.length = 0;
         reject(err);
       });
     });
@@ -331,7 +315,7 @@ function detectExtension(url) {
   }
   if (url.includes('mime=audio%2Fmpeg') || url.includes('mime=audio/mpeg')) return 'mp3';
   if (url.includes('mime=audio%2Fmp4')  || url.includes('mime=audio/mp4'))  return 'm4a';
-  return 'mp3'; // fallback seguro para Alexa
+  return 'mp3';
 }
 function extToContentType(ext) {
   if (ext === 'mp3') return 'audio/mpeg';
@@ -343,15 +327,21 @@ function extToContentType(ext) {
 // ====================== PROCESAR JOB ======================
 async function processJob(query, chatId) {
   const hash  = md5(query.toLowerCase().trim());
-  const r2Key = `songs/${hash}.mp3`; // placeholder, se recalcula abajo con ext real
+  const r2Key = `songs/${hash}.mp3`; // placeholder
 
-  // ¿Ya en R2? Buscar con ambas extensiones posibles
+  // ¿Ya en R2? Buscar con extensiones posibles
   for (const tryExt of ['mp3', 'm4a', 'aac']) {
     const tryKey = `songs/${hash}.${tryExt}`;
     try {
       await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: tryKey }));
       const r2Url = `${R2_PUBLIC_URL}/${tryKey}`;
-      // Guardar en caché (incluye query_text)
+
+      // Auto-reparar nombre si está vacío o es 'desconocido'
+      await pool.query(
+        `UPDATE url_cache SET query_text = $1 WHERE query_hash = $2 AND (query_text IS NULL OR query_text = 'desconocido')`,
+        [query, hash]
+      );
+
       await pool.query(
         `INSERT INTO url_cache (query_hash, query_text, r2_url, source, ts)
          VALUES ($1, $2, $3, $4, $5)
@@ -366,7 +356,6 @@ async function processJob(query, chatId) {
   // Obtener URL directa
   const { url: audioUrl, source } = await getDirectUrl(query);
 
-  // Descargar con límite de tamaño
   console.log(`⬇️ Descargando ${query}...`);
   const buf = await downloadBufferLimited(audioUrl, 20);
   console.log(`📦 ${(buf.length / 1024 / 1024).toFixed(1)} MB`);
@@ -374,7 +363,6 @@ async function processJob(query, chatId) {
   if (buf.length < 50000)
     throw new Error(`Archivo demasiado pequeño: ${buf.length} bytes`);
 
-  // Detectar extensión real y subir a R2
   const finalExt  = detectExtension(audioUrl);
   const finalKey  = `songs/${hash}.${finalExt}`;
   const contentType = extToContentType(finalExt);
@@ -388,7 +376,6 @@ async function processJob(query, chatId) {
   }));
   const r2Url = `${R2_PUBLIC_URL}/${finalKey}`;
 
-  // Guardar en PostgreSQL con query_text
   await pool.query(
     `INSERT INTO url_cache (query_hash, query_text, r2_url, source, ts)
      VALUES ($1, $2, $3, $4, $5)
@@ -396,7 +383,6 @@ async function processJob(query, chatId) {
     [hash, query, r2Url, source, Date.now()]
   );
 
-  // Notificar por Telegram
   await tgSend(chatId,
     `🎵 *${query}* lista.\nURL: ${r2Url}\nFuente: \`${source}\` | _Di a Alexa: pon ${query}_`
   );
@@ -446,8 +432,8 @@ async function runWorker() {
 }
 
 // ====================== MONITOR DE MEMORIA ======================
-const RAM_WARN_MB  = 350;  // Avisar en log
-const RAM_PAUSE_MB = 430;  // Pausar nuevos jobs (límite Render free ~512MB)
+const RAM_WARN_MB  = 350;
+const RAM_PAUSE_MB = 430;
 
 function getRamMB() {
   return process.memoryUsage().rss / 1024 / 1024;
@@ -489,6 +475,14 @@ app.post('/precache', async (req, res) => {
       `SELECT r2_url, query_text FROM url_cache WHERE query_hash=$1`, [hash]
     );
     if (cached.rows.length) {
+      // Auto-reparar nombre si está vacío o es 'desconocido'
+      if (!cached.rows[0].query_text || cached.rows[0].query_text === 'desconocido') {
+        await pool.query(
+          `UPDATE url_cache SET query_text = $1 WHERE query_hash = $2`,
+          [query, hash]
+        );
+        cached.rows[0].query_text = query;
+      }
       return res.json({ status: 'ready', url: cached.rows[0].r2_url, query_text: cached.rows[0].query_text, source: 'cache' });
     }
     await pool.query(
@@ -510,7 +504,9 @@ app.get('/get', async (req, res) => {
     const r = await pool.query(
       `SELECT r2_url, source, query_text FROM url_cache WHERE query_hash=$1`, [hash]
     );
-    if (r.rows.length) return res.json({ url: r.rows[0].r2_url, source: r.rows[0].source, query_text: r.rows[0].query_text });
+    if (r.rows.length) {
+      return res.json({ url: r.rows[0].r2_url, source: r.rows[0].source, query_text: r.rows[0].query_text });
+    }
     res.status(404).json({ error: 'not in cache' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
