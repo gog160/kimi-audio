@@ -2,7 +2,7 @@
 // Estrategias: android/android_music/mweb + Piped validado + SoundCloud
 // Sin ffmpeg: formato forzado m4a/mp3 desde yt-dlp
 // R2 persistente + PostgreSQL para cola + Telegram notificación
-// Nueva funcionalidad: endpoint /canciones con paginación (query_text incluido)
+// Nuevo endpoint /canciones con paginación y COALESCE para query_text
 
 import express  from 'express';
 import { exec } from 'child_process';
@@ -46,7 +46,7 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS url_cache (
       query_hash TEXT PRIMARY KEY,
-      query_text TEXT,                -- 👈 NUEVO: nombre de la canción
+      query_text TEXT,
       r2_url     TEXT,
       source     TEXT,
       ts         BIGINT
@@ -522,7 +522,10 @@ app.get('/canciones', async (req, res) => {
   const order  = req.query.order === 'asc' ? 'ASC' : 'DESC';
   try {
     const r = await pool.query(
-      `SELECT query_text, r2_url, source, ts FROM url_cache ORDER BY ts ${order} LIMIT $1 OFFSET $2`,
+      `SELECT COALESCE(query_text, 'desconocido') AS query_text, r2_url, source, ts
+       FROM url_cache
+       ORDER BY ts ${order}
+       LIMIT $1 OFFSET $2`,
       [limit, offset]
     );
     const t = await pool.query('SELECT COUNT(*) FROM url_cache');
